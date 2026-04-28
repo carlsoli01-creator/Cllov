@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NEON STORM</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #000;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Courier New', monospace;
+    cursor: none;
+  }
+  canvas {
+    display: block;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 800, H = 600;
+canvas.width = W;
+canvas.height = H;
+
+// ─── Audio ───────────────────────────────────────────────────────────────────
+const AC = new (window.AudioContext || window.webkitAudioContext)();
+function beep(freq, dur, vol = 0.3, type = 'sine') {
+  try {
+    const o = AC.createOscillator();
+    const g = AC.createGain();
+    o.connect(g); g.connect(AC.destination);
+    o.type = type; o.frequency.value = freq;
+    g.gain.setValueAtTime(vol, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime + dur);
+    o.start(); o.stop(AC.currentTime + dur);
+  } catch(e) {}
+}
+function playGraze() { beep(800, 0.05, 0.2, 'square'); beep(1200, 0.05, 0.15, 'sine'); }
+function playDie()   { beep(200, 0.4, 0.4, 'sawtooth'); beep(100, 0.6, 0.3, 'square'); }
+function playBomb()  { for(let i=0;i<5;i++) setTimeout(()=>beep(400+i*200, 0.15, 0.25, 'sine'),i*50); }
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let state = 'menu'; // menu | playing | dead
+let score = 0, hiScore = +localStorage.getItem('ns_hi') || 0;
+let elapsed = 0, combo = 0, bombMeter = 0;
+let deathTimer = 0, startTime = 0;
+let shake = 0, flashAlpha = 0;
+let mx = W/2, my = H/2;
+
+// ─── Player ───────────────────────────────────────────────────────────────────
+const player = {
+  x: W/2, y: H/2, r: 10,
+  vx: 0, vy: 0,
+  trail: [],
+  hue: 0,
+  invincible: 0,
+  speed: 4.5
+};
+
+// ─── Game objects ─────────────────────────────────────────────────────────────
+let bullets = [], particles = [], spawners = [], stars = [];
+
+// ─── Palette ──────────────────────────────────────────────────────────────────
+const COLORS = ['#ff2d78','#ff6b35','#ffe600','#39ff14','#00cfff','#bf5fff','#ff85e0'];
+const GLOW   = ['rgba(255,45,120,','rgba(255,107,53,','rgba(255,230,0,',
+                'rgba(57,255,20,','rgba(0,207,255,','rgba(191,95,255,','rgba(255,133,224,'];
+
+function randColor(i) { i = i ?? Math.floor(Math.random()*COLORS.length); return COLORS[i]; }
+
+// ─── Stars background ─────────────────────────────────────────────────────────
+for(let i=0;i<120;i++) stars.push({x:Math.random()*W, y:Math.random()*H, r:Math.random()*1.5+0.3, twinkle:Math.random()*Math.PI*2});
+
+// ─── Keys ─────────────────────────────────────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if(e.code==='Space' && state==='playing' && bombMeter>=1) useBomb();
+  if(e.key==='Enter' || e.code==='Space') tryStart();
+});
+document.addEventListener('keyup', e => keys[e.key] = false);
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mx = (e.clientX - r.left) * (W/r.width);
+  my = (e.clientY - r.top)  * (H/r.height);
+});
+canvas.addEventListener('click', () => tryStart());
+
+function tryStart() {
+  if(AC.state === 'suspended') AC.resume();
+  if(state === 'menu' || state === 'dead') startGame();
+}
+
+// ─── Game logic ───────────────────────────────────────────────────────────────
+function startGame() {
+  score = 0; elapsed = 0; combo = 0; bombMeter = 0;
+  bullets = []; particles = []; spawners = [];
+  player.x = W/2; player.y = H/2; player.vx = 0; player.vy = 0;
+  player.trail = []; player.invincible = 120; player.hue = 0;
+  startTime = performance.now();
+  setupSpawners();
+  state = 'playing';
+}
+
+function useBomb() {
+  bombMeter = 0; playBomb(); shake = 25; flashAlpha = 0.7;
+  for(let b of bullets) spawnParticles(b.x, b.y, b.col, 4);
+  bullets = [];
+  score += 500; combo += 2;
+}
+
+// ─── Bullet helpers ───────────────────────────────────────────────────────────
+function spawnBullet(x,y,vx,vy,r,col,homing=false) {
+  bullets.push({x,y,vx,vy,r,col,homing,age:0});
+}
+
+function aimed(ox,oy,spd,r,col) {
+  const dx=player.x-ox, dy=player.y-oy, d=Math.sqrt(dx*dx+dy*dy)||1;
+  spawnBullet(ox,oy,(dx/d)*spd,(dy/d)*spd,r,col);
+}
+
+function burst(cx,cy,n,spd,r,col,offset=0) {
+  for(let i=0;i<n;i++) {
+    const a = (i/n)*Math.PI*2+offset;
+    spawnBullet(cx,cy,Math.cos(a)*spd,Math.sin(a)*spd,r,col);
+  }
+}
+
+function edgePos() {
+  const side = Math.random()*4|0;
+  if(side===0) return {x:Math.random()*W, y:-20};
+  if(side===1) return {x:W+20, y:Math.random()*H};
+  if(side===2) return {x:Math.random()*W, y:H+20};
+  return {x:-20, y:Math.random()*H};
+}
+
+// ─── Spawner system ───────────────────────────────────────────────────────────
+function setupSpawners() {
+  spawners = [
+    // aimed shots from edges — always active
+    { interval: 1200, timer: 0, minTime: 0, fn: () => {
+      const p = edgePos(); const c = randColor();
+      aimed(p.x,p.y, 3.5, 6, c);
+      beep(300,0.04,0.1,'square');
+    }},
+    // radial bursts
+    { interval: 3000, timer: 1500, minTime: 0, fn: () => {
+      const p = edgePos(); const c = randColor();
+      burst(p.x,p.y,8,2.5,5,c);
+    }},
+    // spiral from center edge
+    { interval: 100, timer: 0, minTime: 8, spiralAngle: 0, fn(dt) {
+      if(elapsed < 8) return;
+      const spd = difficulty() > 1.5 ? 3 : 2.2;
+      const cx = Math.random()<0.5?-20:W+20, cy = H/2;
+      const a = this.spiralAngle; this.spiralAngle += 0.22;
+      spawnBullet(cx,cy,Math.cos(a)*spd,Math.sin(a)*spd,5,randColor());
+    }},
+    // horizontal walls with gap
+    { interval: 5000, timer: 2500, minTime: 15, fn: () => {
+      if(elapsed < 15) return;
+      const y = Math.random()*(H-100)+50;
+      const gap = 80+Math.random()*80;
+      const gapX = Math.random()*(W-gap*2)+gap;
+      const c = randColor(); const spd = 4;
+      for(let x=0;x<W;x+=22) {
+        if(x < gapX || x > gapX+gap) {
+          setTimeout(()=>spawnBullet(x,-15,0,spd,7,c), Math.abs(x-W/2)*1.5);
+        }
+      }
+    }},
+    // homing bullets (slow, red glow)
+    { interval: 4000, timer: 3000, minTime: 25, fn: () => {
+      if(elapsed < 25) return;
+      const p = edgePos();
+      spawnBullet(p.x,p.y,0,0,8,'#ff2d78',true);
+    }},
+    // cross pattern
+    { interval: 3500, timer: 0, minTime: 20, fn: () => {
+      if(elapsed < 20) return;
+      const c = randColor(); const spd = 2.8;
+      for(let i=0;i<4;i++) {
+        const a = (i/4)*Math.PI*2;
+        for(let j=0;j<3;j++) {
+          const t = j*300;
+          setTimeout(()=>{
+            burst(W/2,H/2,12,spd,5,c,a+(j*0.1));
+          },t);
+        }
+      }
+    }},
+    // fast aimed volley
+    { interval: 2000, timer: 500, minTime: 30, fn: () => {
+      if(elapsed < 30) return;
+      const p = edgePos(); const c = randColor();
+      for(let i=0;i<3;i++) setTimeout(()=>aimed(p.x,p.y,5+difficulty()*0.5,5,c),i*120);
+    }}
+  ];
+}
+
+function difficulty() {
+  return Math.min(1 + elapsed/40, 3.5);
+}
+
+function updateSpawners(dt) {
+  const dif = difficulty();
+  for(let s of spawners) {
+    s.timer -= dt;
+    if(s.timer <= 0) {
+      s.fn(dt);
+      s.timer = s.interval / dif;
+    }
+  }
+  // also speed up aimed interval
+  spawners[0].interval = Math.max(400, 1200 - elapsed*8);
+}
+
+// ─── Particles ────────────────────────────────────────────────────────────────
+function spawnParticles(x,y,col,n=8,spd=4) {
+  for(let i=0;i<n;i++) {
+    const a = Math.random()*Math.PI*2;
+    const s = Math.random()*spd+1;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,col,life:1,r:Math.random()*3+1});
+  }
+}
+
+// ─── Collision ────────────────────────────────────────────────────────────────
+function dist(a,b) { const dx=a.x-b.x, dy=a.y-b.y; return Math.sqrt(dx*dx+dy*dy); }
+
+// ─── Update ───────────────────────────────────────────────────────────────────
+let last = 0;
+function update(now) {
+  const dt = Math.min(now-last, 50); last = now;
+  if(state!=='playing') return;
+
+  elapsed = (now-startTime)/1000;
+  score = Math.floor(elapsed*10) + Math.floor(combo*15);
+
+  // player movement (arrows or WASD)
+  let dx=0, dy=0;
+  if(keys['ArrowLeft']||keys['a']||keys['A']) dx-=1;
+  if(keys['ArrowRight']||keys['d']||keys['D']) dx+=1;
+  if(keys['ArrowUp']||keys['w']||keys['W']) dy-=1;
+  if(keys['ArrowDown']||keys['s']||keys['S']) dy+=1;
+
+  // mouse also steers
+  const toMX = mx-player.x, toMY = my-player.y;
+  const toMD = Math.sqrt(toMX*toMX+toMY*toMY);
+  if(toMD > 5) { dx += toMX/toMD * 1.5; dy += toMY/toMD * 1.5; }
+
+  const dlen = Math.sqrt(dx*dx+dy*dy)||1;
+  if(dx!==0||dy!==0) { player.vx += (dx/dlen)*0.8; player.vy += (dy/dlen)*0.8; }
+  player.vx *= 0.82; player.vy *= 0.82;
+  const spd = Math.sqrt(player.vx*player.vx+player.vy*player.vy);
+  if(spd > player.speed) { player.vx *= player.speed/spd; player.vy *= player.speed/spd; }
+  player.x = Math.max(player.r, Math.min(W-player.r, player.x+player.vx));
+  player.y = Math.max(player.r, Math.min(H-player.r, player.y+player.vy));
+
+  player.hue = (player.hue+2)%360;
+  player.invincible = Math.max(0, player.invincible-1);
+
+  // trail
+  player.trail.unshift({x:player.x, y:player.y});
+  if(player.trail.length > 22) player.trail.pop();
+
+  // homing update
+  for(let b of bullets) {
+    if(b.homing) {
+      const dx2=player.x-b.x, dy2=player.y-b.y, d=Math.sqrt(dx2*dx2+dy2*dy2)||1;
+      const spd2 = Math.min(2.5+elapsed*0.03, 4);
+      b.vx = b.vx*0.92 + (dx2/d)*spd2*0.08;
+      b.vy = b.vy*0.92 + (dy2/d)*spd2*0.08;
+    }
+    b.x+=b.vx; b.y+=b.vy; b.age++;
+  }
+
+  // update spawners
+  updateSpawners(dt);
+
+  // collision check
+  if(player.invincible<=0) {
+    for(let i=bullets.length-1;i>=0;i--) {
+      const b=bullets[i];
+      const d = dist(player,b);
+      const grazeR = player.r+b.r+10;
+      const hitR   = player.r+b.r-4;
+      if(d < hitR) {
+        // HIT
+        playDie(); shake=30; flashAlpha=1;
+        spawnParticles(player.x,player.y,'#fff',20,6);
+        if(score>hiScore) { hiScore=score; localStorage.setItem('ns_hi',hiScore); }
+        deathTimer=180; state='dead'; return;
+      } else if(d < grazeR && b.age > 10) {
+        // GRAZE
+        bullets.splice(i,1);
+        combo++; bombMeter=Math.min(1,bombMeter+0.1);
+        score += 50*(1+Math.floor(combo/5));
+        playGraze();
+        spawnParticles(b.x,b.y,b.col,6,3);
+      }
+    }
+  }
+
+  // remove off-screen bullets (after longer grace period to catch walls)
+  bullets = bullets.filter(b => b.x>-60&&b.x<W+60&&b.y>-60&&b.y<H+60);
+
+  // particles
+  for(let p of particles) { p.x+=p.vx; p.y+=p.vy; p.vx*=0.92; p.vy*=0.92; p.life-=0.04; }
+  particles = particles.filter(p=>p.life>0);
+
+  // shake decay
+  shake*=0.85; flashAlpha*=0.88;
+}
+
+// ─── Draw ─────────────────────────────────────────────────────────────────────
+function drawGlow(x,y,r,col,alpha=1) {
+  const ci = COLORS.indexOf(col);
+  const gc = ci>=0 ? GLOW[ci] : 'rgba(255,255,255,';
+  const grad = ctx.createRadialGradient(x,y,0,x,y,r*3);
+  grad.addColorStop(0, gc+(alpha*0.8)+')');
+  grad.addColorStop(1, gc+'0)');
+  ctx.fillStyle=grad;
+  ctx.beginPath(); ctx.arc(x,y,r*3,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle=col;
+  ctx.globalAlpha=alpha;
+  ctx.beginPath(); ctx.arc(x,y,r,0,Math.PI*2); ctx.fill();
+  ctx.globalAlpha=1;
+}
+
+function drawText(txt,x,y,size,col,glow=true) {
+  ctx.font = `bold ${size}px 'Courier New', monospace`;
+  ctx.textAlign='center';
+  if(glow) { ctx.shadowBlur=20; ctx.shadowColor=col; }
+  ctx.fillStyle=col; ctx.fillText(txt,x,y);
+  ctx.shadowBlur=0;
+}
+
+function drawHUD() {
+  // score
+  drawText(`SCORE  ${score}`, W/2, 35, 22, '#00cfff');
+  drawText(`BEST  ${hiScore}`, W/2, 58, 14, '#bf5fff');
+  // time
+  const t = elapsed|0;
+  drawText(`${String(Math.floor(t/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')}`, W-70, 35, 20, '#ffe600');
+  // combo
+  if(combo>0) drawText(`x${combo} COMBO`, 80, 35, 18, '#ff2d78');
+
+  // bomb meter
+  const bw=150, bh=12, bx=W/2-bw/2, by=H-28;
+  ctx.strokeStyle='#444'; ctx.lineWidth=2;
+  ctx.strokeRect(bx,by,bw,bh);
+  if(bombMeter>0) {
+    const grad=ctx.createLinearGradient(bx,0,bx+bw,0);
+    grad.addColorStop(0,'#ff2d78'); grad.addColorStop(1,'#bf5fff');
+    ctx.fillStyle=grad;
+    ctx.fillRect(bx,by,bw*bombMeter,bh);
+  }
+  const label = bombMeter>=1 ? '[ SPACE ] BOMB READY!' : 'BOMB METER';
+  const lc = bombMeter>=1 ? '#ffe600' : '#666';
+  ctx.font='11px Courier New'; ctx.textAlign='center';
+  ctx.fillStyle=lc; ctx.shadowBlur = bombMeter>=1?15:0; ctx.shadowColor='#ffe600';
+  ctx.fillText(label, W/2, by-5); ctx.shadowBlur=0;
+}
+
+function draw(now) {
+  // screen shake
+  ctx.save();
+  if(shake>1) ctx.translate((Math.random()-0.5)*shake*0.6,(Math.random()-0.5)*shake*0.6);
+
+  // background
+  ctx.fillStyle='#07050f';
+  ctx.fillRect(0,0,W,H);
+
+  // grid
+  ctx.strokeStyle='rgba(255,255,255,0.04)'; ctx.lineWidth=1;
+  for(let x=0;x<W;x+=40){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,H);ctx.stroke();}
+  for(let y=0;y<H;y+=40){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();}
+
+  // stars
+  for(let s of stars) {
+    s.twinkle+=0.02;
+    const a=0.3+Math.sin(s.twinkle)*0.3;
+    ctx.globalAlpha=a; ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(s.x,s.y,s.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1;
+
+  if(state==='menu') {
+    drawMenu();
+  } else if(state==='playing' || state==='dead') {
+    drawGame(now);
+    if(state==='dead') drawDead(now);
+  }
+
+  // flash overlay
+  if(flashAlpha>0.01) {
+    ctx.fillStyle=`rgba(255,255,255,${flashAlpha})`;
+    ctx.fillRect(0,0,W,H);
+  }
+
+  ctx.restore();
+  requestAnimationFrame(t=>{ update(t); draw(t); });
+}
+
+function drawGame(now) {
+  // particles behind
+  for(let p of particles) {
+    ctx.globalAlpha=p.life*0.8;
+    ctx.shadowBlur=8; ctx.shadowColor=p.col;
+    ctx.fillStyle=p.col;
+    ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1; ctx.shadowBlur=0;
+
+  // player trail
+  for(let i=0;i<player.trail.length;i++) {
+    const t=player.trail[i];
+    const a=(1-i/player.trail.length)*0.6;
+    const hue=(player.hue+i*10)%360;
+    ctx.globalAlpha=a;
+    ctx.shadowBlur=10; ctx.shadowColor=`hsl(${hue},100%,60%)`;
+    ctx.fillStyle=`hsl(${hue},100%,60%)`;
+    const r=player.r*(1-i/player.trail.length)*0.7;
+    ctx.beginPath(); ctx.arc(t.x,t.y,r,0,Math.PI*2); ctx.fill();
+  }
+  ctx.globalAlpha=1; ctx.shadowBlur=0;
+
+  // bullets
+  for(let b of bullets) {
+    drawGlow(b.x,b.y,b.r,b.col,0.9);
+  }
+
+  // player
+  if(player.invincible>0 && Math.floor(player.invincible/4)%2===0) {
+    // blinking
+  } else {
+    const pc=`hsl(${player.hue},100%,65%)`;
+    ctx.shadowBlur=30; ctx.shadowColor=pc;
+    ctx.fillStyle=pc;
+    ctx.beginPath(); ctx.arc(player.x,player.y,player.r,0,Math.PI*2); ctx.fill();
+    // inner white dot
+    ctx.fillStyle='#fff'; ctx.shadowBlur=0;
+    ctx.beginPath(); ctx.arc(player.x,player.y,3,0,Math.PI*2); ctx.fill();
+    ctx.shadowBlur=0;
+  }
+
+  // mouse cursor crosshair
+  ctx.strokeStyle='rgba(255,255,255,0.3)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(mx-8,my); ctx.lineTo(mx+8,my); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(mx,my-8); ctx.lineTo(mx,my+8); ctx.stroke();
+
+  drawHUD();
+}
+
+function drawMenu() {
+  // title
+  ctx.shadowBlur=40; ctx.shadowColor='#00cfff';
+  ctx.fillStyle='#00cfff';
+  ctx.font="bold 80px 'Courier New', monospace";
+  ctx.textAlign='center';
+  ctx.fillText('NEON', W/2, H/2-80);
+  ctx.shadowColor='#ff2d78'; ctx.fillStyle='#ff2d78';
+  ctx.fillText('STORM', W/2, H/2-5);
+  ctx.shadowBlur=0;
+
+  drawText('Dodge bullets. Graze for points.', W/2, H/2+55, 16, '#ffe600', false);
+  drawText('MOUSE or WASD to move', W/2, H/2+80, 14, '#888', false);
+  drawText('GRAZE bullets to fill BOMB meter', W/2, H/2+100, 14, '#888', false);
+  drawText('SPACE when Bomb meter is full = screen clear', W/2, H/2+120, 14, '#888', false);
+
+  const pulse = 0.6+Math.sin(Date.now()/400)*0.4;
+  ctx.globalAlpha=pulse;
+  drawText('CLICK or PRESS ENTER to play', W/2, H/2+160, 20, '#39ff14');
+  ctx.globalAlpha=1;
+
+  if(hiScore>0) drawText(`BEST SCORE: ${hiScore}`, W/2, H/2+195, 16, '#bf5fff');
+}
+
+function drawDead() {
+  deathTimer--;
+  ctx.fillStyle='rgba(7,5,15,0.6)';
+  ctx.fillRect(0,0,W,H);
+
+  ctx.shadowBlur=30; ctx.shadowColor='#ff2d78';
+  ctx.fillStyle='#ff2d78';
+  ctx.font="bold 60px 'Courier New', monospace";
+  ctx.textAlign='center';
+  ctx.fillText('YOU DIED', W/2, H/2-50);
+  ctx.shadowBlur=0;
+
+  drawText(`SCORE  ${score}`, W/2, H/2+10, 28, '#ffe600');
+  if(score>=hiScore) drawText('NEW BEST!', W/2, H/2+45, 22, '#39ff14');
+  else drawText(`BEST  ${hiScore}`, W/2, H/2+45, 18, '#bf5fff');
+
+  const t = Math.floor(elapsed);
+  drawText(`SURVIVED  ${String(Math.floor(t/60)).padStart(2,'0')}:${String(t%60).padStart(2,'0')}`, W/2, H/2+75, 16, '#00cfff', false);
+
+  if(deathTimer<100) {
+    const pulse=0.6+Math.sin(Date.now()/400)*0.4;
+    ctx.globalAlpha=pulse;
+    drawText('CLICK or ENTER to try again', W/2, H/2+120, 18, '#fff');
+    ctx.globalAlpha=1;
+  }
+}
+
+// ─── Kick off ─────────────────────────────────────────────────────────────────
+requestAnimationFrame(t=>{ last=t; draw(t); });
+</script>
+</body>
+</html>
